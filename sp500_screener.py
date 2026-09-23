@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-S&P 500 Multi-Edge Screener — Cloud Version v2
+S&P 500 Multi-Edge Screener — Cloud Version v3
 ================================================
-الإصلاحات في هذه النسخة:
-- التحقق من NaN في آخر صف لكل سهم
-- التحقق من آخر تاريخ متوقع للبيانات
-- طباعة تشخيصية واضحة في الـlogs
+الإصلاحات:
+- تحويل الأعمدة الرقمية من Sheets إلى float
+- حماية evaluate_open_picks من القيم غير الصالحة
+- التحقق من NaN في آخر صف
+- التحقق من حداثة البيانات
+- تشخيص مفصل في الـlogs
 """
 
 import os
@@ -14,7 +16,6 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -86,7 +87,7 @@ class FilterConfig:
 
 
 # ============================================================
-# المؤشرات
+# المؤشرات الفنية
 # ============================================================
 def true_range(df):
     prev_close = df["close"].shift(1)
@@ -381,7 +382,7 @@ def download_prices(tickers, period="1y"):
 
 
 def prices_to_long(prices_wide):
-    """✅ مُحدّث: يتحقق من NaN في آخر صف."""
+    """يتحقق من NaN في آخر صف لكل سهم."""
     records = []
     for ticker in prices_wide.columns.levels[0]:
         try:
@@ -400,7 +401,6 @@ def prices_to_long(prices_wide):
     long_df["date"] = pd.to_datetime(long_df["date"])
     long_df = long_df.sort_values(["ticker", "date"])
 
-    # ✅ تشخيص NaN في آخر صف
     print("\n" + "=" * 60)
     print("🔍 التحقق من آخر صف لكل سهم")
     print("=" * 60)
@@ -419,7 +419,6 @@ def prices_to_long(prices_wide):
         sample_missing = last_rows[last_rows["close"].isna()]["ticker"].head(5).tolist()
         print(f"   ⚠️ أمثلة: {sample_missing}")
 
-    # احذف الصفوف بدون close
     long_df = long_df.dropna(subset=["close"])
     long_df = long_df.reset_index(drop=True)
     print(f"✅ Long: {long_df.shape[0]:,} صف بعد التنظيف")
@@ -427,7 +426,6 @@ def prices_to_long(prices_wide):
 
 
 def validate_latest_date(long_df):
-    """✅ جديد: تحقق من أن البيانات حديثة بما يكفي."""
     print("\n" + "=" * 60)
     print("🔍 التحقق من حداثة البيانات")
     print("=" * 60)
@@ -440,7 +438,7 @@ def validate_latest_date(long_df):
     print(f"الفارق:                 {days_diff} يوم")
 
     if days_diff > 5:
-        print(f"⚠️ تحذير: البيانات قديمة بـ {days_diff} يوم — راجع المصدر!")
+        print(f"⚠️ تحذير: البيانات قديمة بـ {days_diff} يوم")
     elif days_diff > 3:
         print(f"ℹ️ ملاحظة: بيانات قديمة قليلًا — طبيعي في عطلة نهاية الأسبوع")
     else:
@@ -650,6 +648,7 @@ def get_or_create_ws(sh, title, rows=2000, cols=20):
 
 
 def load_picks_from_sheets(client):
+    """✅ مُصلحة: تحويل الأعمدة الرقمية إلى float."""
     try:
         sh = client.open_by_key(SHEET_ID)
         ws = sh.worksheet("Picks History")
@@ -657,9 +656,19 @@ def load_picks_from_sheets(client):
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
+
+        # ✅ تحويل الأعمدة الرقمية إلى float
+        numeric_cols = ["score", "entry", "stop", "target",
+                        "edge_count", "exit_price", "pnl_pct", "days_held"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # ✅ تحويل التواريخ بحماية
         for col in ["pick_date", "exit_date"]:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
+
         return df
     except Exception as e:
         print(f"ℹ️ لا يوجد picks history بعد: {e}")
@@ -721,6 +730,7 @@ def save_new_picks(results_list, regime, picks_history):
 
 
 def evaluate_open_picks(picks_history, prices_df, max_hold_days=HOLD_DAYS):
+    """✅ مُصلحة: حماية من القيم غير الصالحة."""
     if len(picks_history) == 0:
         return picks_history
     prices_df = prices_df.copy()
@@ -734,9 +744,18 @@ def evaluate_open_picks(picks_history, prices_df, max_hold_days=HOLD_DAYS):
         except Exception:
             continue
         ticker = row["ticker"]
-        entry = float(row["entry"])
-        stop = float(row["stop"])
-        target = float(row["target"])
+
+        # ✅ حماية: تجاهل إذا القيم غير صالحة
+        try:
+            entry = float(row["entry"])
+            stop = float(row["stop"])
+            target = float(row["target"])
+        except (ValueError, TypeError):
+            print(f"⚠️ تخطي {ticker}: قيم entry/stop/target غير صالحة")
+            continue
+        if pd.isna(entry) or pd.isna(stop) or pd.isna(target):
+            print(f"⚠️ تخطي {ticker}: قيم NaN")
+            continue
 
         sub = prices_df[(prices_df["ticker"] == ticker) &
                         (prices_df["date"] > pick_date)].sort_values("date")
@@ -892,8 +911,8 @@ def main():
         print("❌ فشل تحميل الأسعار")
         sys.exit(1)
 
-    long_df = prices_to_long(prices_wide)         # ✅ محدّث
-    validate_latest_date(long_df)                  # ✅ جديد
+    long_df = prices_to_long(prices_wide)
+    validate_latest_date(long_df)
     spy_df = download_spy(period=PERIOD)
     meta_df = fetch_metadata(tickers, max_tickers=MAX_META)
     blackout_set = build_earnings_blackout(meta_df, window_days=3)
