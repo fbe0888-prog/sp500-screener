@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-S&P 500 Multi-Edge Screener — Cloud Version v3
+S&P 500 Multi-Edge Screener — Cloud Version v4
 ================================================
 الإصلاحات:
-- تحويل الأعمدة الرقمية من Sheets إلى float
-- حماية evaluate_open_picks من القيم غير الصالحة
-- التحقق من NaN في آخر صف
-- التحقق من حداثة البيانات
+- load_picks_from_sheets: تحويل الأعمدة الرقمية إلى float
+- evaluate_open_picks: حماية try/except لكل صف + logging
+- prices_to_long: التحقق من NaN في آخر صف
+- validate_latest_date: التحقق من حداثة البيانات
 - تشخيص مفصل في الـlogs
 """
 
@@ -648,7 +648,7 @@ def get_or_create_ws(sh, title, rows=2000, cols=20):
 
 
 def load_picks_from_sheets(client):
-    """✅ مُصلحة: تحويل الأعمدة الرقمية إلى float."""
+    """تحويل الأعمدة الرقمية من Sheets إلى float."""
     try:
         sh = client.open_by_key(SHEET_ID)
         ws = sh.worksheet("Picks History")
@@ -657,14 +657,12 @@ def load_picks_from_sheets(client):
             return pd.DataFrame()
         df = pd.DataFrame(data)
 
-        # ✅ تحويل الأعمدة الرقمية إلى float
         numeric_cols = ["score", "entry", "stop", "target",
                         "edge_count", "exit_price", "pnl_pct", "days_held"]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # ✅ تحويل التواريخ بحماية
         for col in ["pick_date", "exit_date"]:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -730,64 +728,94 @@ def save_new_picks(results_list, regime, picks_history):
 
 
 def evaluate_open_picks(picks_history, prices_df, max_hold_days=HOLD_DAYS):
-    """✅ مُصلحة: حماية من القيم غير الصالحة."""
+    """محصّنة: try/except لكل صف + logging."""
     if len(picks_history) == 0:
+        print("ℹ️ picks_history فارغ — لا شيء لتقييمه")
         return picks_history
+
+    if "status" not in picks_history.columns:
+        print("⚠️ لا يوجد عمود status — تخطي التقييم")
+        return picks_history
+
     prices_df = prices_df.copy()
     prices_df["date"] = pd.to_datetime(prices_df["date"])
 
+    evaluated = 0
+    skipped = 0
+    open_count = 0
+
     for idx, row in picks_history.iterrows():
-        if row.get("status") != "open":
-            continue
         try:
+            status_val = str(row.get("status", "")).strip()
+            if status_val != "open":
+                continue
+            open_count += 1
+
             pick_date = pd.Timestamp(row["pick_date"])
-        except Exception:
+            if pd.isna(pick_date):
+                print(f"⚠️ تخطي صف {idx}: pick_date فارغ")
+                skipped += 1
+                continue
+
+            ticker = str(row.get("ticker", "")).strip()
+            if not ticker:
+                skipped += 1
+                continue
+
+            try:
+                entry = float(row["entry"])
+                stop = float(row["stop"])
+                target = float(row["target"])
+            except (ValueError, TypeError) as e:
+                print(f"⚠️ تخطي {ticker}: قيم غير صالحة ({e})")
+                skipped += 1
+                continue
+
+            if pd.isna(entry) or pd.isna(stop) or pd.isna(target):
+                print(f"⚠️ تخطي {ticker}: قيم NaN")
+                skipped += 1
+                continue
+
+            sub = prices_df[(prices_df["ticker"] == ticker) &
+                            (prices_df["date"] > pick_date)].sort_values("date")
+            if len(sub) < max_hold_days:
+                continue
+
+            window = sub.head(max_hold_days).reset_index(drop=True)
+            outcome = "timeout"
+            exit_date = window.iloc[-1]["date"]
+            exit_price = window.iloc[-1]["close"]
+
+            for _, day in window.iterrows():
+                hit_stop = day["low"] <= stop
+                hit_target = day["high"] >= target
+                if hit_stop and hit_target:
+                    outcome, exit_price, exit_date = "loss", stop, day["date"]
+                    break
+                elif hit_stop:
+                    outcome, exit_price, exit_date = "loss", stop, day["date"]
+                    break
+                elif hit_target:
+                    outcome, exit_price, exit_date = "win", target, day["date"]
+                    break
+
+            pnl_pct = (exit_price - entry) / entry * 100
+            days_held = (pd.Timestamp(exit_date) - pick_date).days
+
+            picks_history.at[idx, "status"] = outcome
+            picks_history.at[idx, "exit_date"] = str(pd.Timestamp(exit_date).date())
+            picks_history.at[idx, "exit_price"] = round(float(exit_price), 2)
+            picks_history.at[idx, "pnl_pct"] = round(float(pnl_pct), 2)
+            picks_history.at[idx, "days_held"] = int(days_held)
+            evaluated += 1
+
+        except Exception as e:
+            print(f"⚠️ خطأ في تقييم صف {idx}: {type(e).__name__}: {e}")
+            skipped += 1
             continue
-        ticker = row["ticker"]
 
-        # ✅ حماية: تجاهل إذا القيم غير صالحة
-        try:
-            entry = float(row["entry"])
-            stop = float(row["stop"])
-            target = float(row["target"])
-        except (ValueError, TypeError):
-            print(f"⚠️ تخطي {ticker}: قيم entry/stop/target غير صالحة")
-            continue
-        if pd.isna(entry) or pd.isna(stop) or pd.isna(target):
-            print(f"⚠️ تخطي {ticker}: قيم NaN")
-            continue
-
-        sub = prices_df[(prices_df["ticker"] == ticker) &
-                        (prices_df["date"] > pick_date)].sort_values("date")
-        if len(sub) < max_hold_days:
-            continue
-
-        window = sub.head(max_hold_days).reset_index(drop=True)
-        outcome = "timeout"
-        exit_date = window.iloc[-1]["date"]
-        exit_price = window.iloc[-1]["close"]
-
-        for _, day in window.iterrows():
-            hit_stop = day["low"] <= stop
-            hit_target = day["high"] >= target
-            if hit_stop and hit_target:
-                outcome, exit_price, exit_date = "loss", stop, day["date"]
-                break
-            elif hit_stop:
-                outcome, exit_price, exit_date = "loss", stop, day["date"]
-                break
-            elif hit_target:
-                outcome, exit_price, exit_date = "win", target, day["date"]
-                break
-
-        pnl_pct = (exit_price - entry) / entry * 100
-        days_held = (pd.Timestamp(exit_date) - pick_date).days
-        picks_history.at[idx, "status"] = outcome
-        picks_history.at[idx, "exit_date"] = str(pd.Timestamp(exit_date).date())
-        picks_history.at[idx, "exit_price"] = round(exit_price, 2)
-        picks_history.at[idx, "pnl_pct"] = round(pnl_pct, 2)
-        picks_history.at[idx, "days_held"] = days_held
-
+    print(f"✅ تقييم: {evaluated} محدّثة، {skipped} متخطاة، "
+          f"{open_count} صف مفتوح")
     return picks_history
 
 
