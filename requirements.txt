@@ -1,0 +1,7 @@
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
+gspread>=6.0.0
+gspread-dataframe>=4.0.0
+google-auth>=2.20.0
+lxml>=4.9.0
