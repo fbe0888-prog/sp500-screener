@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-S&P 500 Multi-Edge Screener — Cloud Version
-============================================
-يعمل داخل GitHub Actions:
-- يجلب بيانات S&P 500 من Yahoo Finance
-- يقيّم 40+ إيدج قابل للقياس
-- يحفظ picks_history في Google Sheets (ورقة منفصلة)
-- يصدّر النتائج اليومية إلى Google Sheets
+S&P 500 Multi-Edge Screener — Cloud Version v2
+================================================
+الإصلاحات في هذه النسخة:
+- التحقق من NaN في آخر صف لكل سهم
+- التحقق من آخر تاريخ متوقع للبيانات
+- طباعة تشخيصية واضحة في الـlogs
 """
 
 import os
@@ -15,7 +14,6 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from io import StringIO
 from collections import Counter
 
 import numpy as np
@@ -37,7 +35,7 @@ TOP_N = 8
 MIN_SCORE = 12.0
 JACCARD_THRESHOLD = 0.70
 BATCH_SIZE = 50
-MAX_META = None    # None = كل الأسهم
+MAX_META = None
 
 # ============================================================
 # الإيدجات
@@ -88,7 +86,7 @@ class FilterConfig:
 
 
 # ============================================================
-# المؤشرات الفنية
+# المؤشرات
 # ============================================================
 def true_range(df):
     prev_close = df["close"].shift(1)
@@ -194,7 +192,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
     trend_up = last["close"] > last["sma50"] > (df["sma150"].iloc[-1]
                 if not np.isnan(df["sma150"].iloc[-1]) else -np.inf)
 
-    # Trend / Breakout
     fire(21, last["close"] >= last["hh20"] * 0.999)
     fire(22, last["close"] >= last["hh55"] * 0.999)
     fire(23, not np.isnan(last["atr20"]) and last["atr20"] > 0)
@@ -206,7 +203,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
     fire(28, trend_up and (last["adx14"] > 20 if not np.isnan(last["adx14"]) else False))
     fire(29, last["close"] > last["sma150"] if not np.isnan(last["sma150"]) else False)
 
-    # Growth / Momentum
     fire(33, last["close"] >= df["close"].rolling(252).max().iloc[-1] * 0.98
          if len(df) > 252 else last["close"] >= last["hh55"] * 0.98)
     fire(37, market_trend_up)
@@ -215,7 +211,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
           / df["close"].iloc[-40:-5].mean() < 0.20) if len(df) > 45 else False)
     fire(39, (last["close"] >= last["hh20"] * 0.999) and last["vol_ratio"] > 1.3)
 
-    # Mean-Reversion
     broke_20 = (prev["high"] > df["hh20"].iloc[-3]) if len(df) > 3 else False
     fire(41, broke_20 and last["close"] < prev["close"])
     fire(42, last["rsi2"] < 10 and trend_up)
@@ -224,7 +219,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
          and last["close"] < last["sma20"] and trend_up)
     fire(45, bool(last["nr7"]))
 
-    # RSI(2) متدرج
     rsi2_val = last["rsi2"]
     if not np.isnan(rsi2_val):
         if rsi2_val < 2 or rsi2_val > 98:
@@ -232,7 +226,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
         elif rsi2_val < 5 or rsi2_val > 95:
             fire(47, True, w=weights.get(47, 1.5) * 0.5)
 
-    # S/R مع حجم
     near_hh = abs(last["close"] - last["hh20"]) / last["hh20"] < 0.01
     near_ll = abs(last["close"] - last["ll20"]) / last["ll20"] < 0.01
     fire(50, (near_hh or near_ll) and last["vol_ratio"] > 1.2)
@@ -242,7 +235,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
     gap = (last["open"] - prev["close"]) / prev["close"] if prev["close"] else 0
     fire(49, abs(gap) > 0.02)
 
-    # Volume / Wyckoff
     spring = last["low"] < last["ll20"] and last["close"] > df["ll20"].iloc[-2]
     fire(51, spring)
     fire(52, last["vol_ratio"] > 2.0 or last["vol_ratio"] < 0.5)
@@ -251,7 +243,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
     fire(56, abs(last["close"] - last["sma50"]) / last["sma50"] < 0.01
          or abs(last["close"] - last["sma20"]) / last["sma20"] < 0.01)
 
-    # Growth from metadata
     if meta_row is not None:
         q_growth = meta_row.get("eps_growth_qtr_pct")
         a_growth = meta_row.get("eps_growth_annual_pct")
@@ -260,7 +251,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
         if pd.notna(a_growth):
             fire(32, a_growth > 0.15)
 
-    # Style classification
     trend_set = {21, 22, 23, 24, 25, 26, 27, 28, 29, 33, 37, 38, 39}
     mr_set = {41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52}
     trend_count = len(set(active) & trend_set)
@@ -277,7 +267,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
     else:
         style = "Mixed"
 
-    # Regime fit
     regime_fit = "neutral"
     if regime == "mean_reversion":
         if style == "Mean-Reversion":
@@ -297,7 +286,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
         else:
             pts *= 0.75
 
-    # Normalization
     max_possible = sum(weights.get(e, 1.0) for e in weights) + 4
     normalized_score = max(0, min(100, (pts / max_possible) * 100))
 
@@ -308,7 +296,6 @@ def score_ticker(df, ticker, meta_row, market_trend_up, regime, weights):
     else:
         confidence = "low"
 
-    # Entry / Stop / Target
     entry = last["close"]
     atrv = last["atr20"] if not np.isnan(last["atr20"]) else last["close"] * 0.02
     if style == "Trend" or (style == "Mixed" and trend_count >= mr_count):
@@ -394,6 +381,7 @@ def download_prices(tickers, period="1y"):
 
 
 def prices_to_long(prices_wide):
+    """✅ مُحدّث: يتحقق من NaN في آخر صف."""
     records = []
     for ticker in prices_wide.columns.levels[0]:
         try:
@@ -409,11 +397,54 @@ def prices_to_long(prices_wide):
     if not records:
         return pd.DataFrame()
     long_df = pd.concat(records, ignore_index=True)
-    long_df = long_df.dropna(subset=["close"])
     long_df["date"] = pd.to_datetime(long_df["date"])
-    long_df = long_df.sort_values(["ticker", "date"]).reset_index(drop=True)
-    print(f"✅ Long: {long_df.shape[0]:,} صف")
+    long_df = long_df.sort_values(["ticker", "date"])
+
+    # ✅ تشخيص NaN في آخر صف
+    print("\n" + "=" * 60)
+    print("🔍 التحقق من آخر صف لكل سهم")
+    print("=" * 60)
+    last_rows = long_df.groupby("ticker").tail(1)
+    nan_close = last_rows["close"].isna().sum()
+    total = len(last_rows)
+    last_date_with_close = long_df.dropna(subset=["close"])["date"].max()
+    last_date_any = long_df["date"].max()
+
+    print(f"عدد الأسهم: {total}")
+    print(f"آخر تاريخ في البيانات (أي صف): {last_date_any.date()}")
+    print(f"آخر تاريخ فيه close مكتمل:    {last_date_with_close.date()}")
+    print(f"أسهم بدون close في آخر صف:    {nan_close}/{total}")
+
+    if nan_close > 0:
+        sample_missing = last_rows[last_rows["close"].isna()]["ticker"].head(5).tolist()
+        print(f"   ⚠️ أمثلة: {sample_missing}")
+
+    # احذف الصفوف بدون close
+    long_df = long_df.dropna(subset=["close"])
+    long_df = long_df.reset_index(drop=True)
+    print(f"✅ Long: {long_df.shape[0]:,} صف بعد التنظيف")
     return long_df
+
+
+def validate_latest_date(long_df):
+    """✅ جديد: تحقق من أن البيانات حديثة بما يكفي."""
+    print("\n" + "=" * 60)
+    print("🔍 التحقق من حداثة البيانات")
+    print("=" * 60)
+    latest_data_date = long_df["date"].max()
+    today = pd.Timestamp.now().normalize()
+    days_diff = (today - latest_data_date).days
+
+    print(f"آخر تاريخ في البيانات:  {latest_data_date.date()}")
+    print(f"اليوم:                  {today.date()}")
+    print(f"الفارق:                 {days_diff} يوم")
+
+    if days_diff > 5:
+        print(f"⚠️ تحذير: البيانات قديمة بـ {days_diff} يوم — راجع المصدر!")
+    elif days_diff > 3:
+        print(f"ℹ️ ملاحظة: بيانات قديمة قليلًا — طبيعي في عطلة نهاية الأسبوع")
+    else:
+        print(f"✅ البيانات حديثة")
 
 
 def fetch_metadata(tickers, max_tickers=None):
@@ -468,7 +499,8 @@ def download_spy(period="1y"):
     spy = spy.rename(columns={"adj close": "adj_close"})
     spy["date"] = pd.to_datetime(spy["date"])
     spy = spy.sort_values("date").reset_index(drop=True)
-    print(f"✅ SPY: {len(spy)} صف")
+    spy = spy.dropna(subset=["close"])
+    print(f"✅ SPY: {len(spy)} صف، آخر تاريخ: {spy['date'].max().date()}")
     return spy
 
 
@@ -566,7 +598,6 @@ def run_screen_from_data(prices_df, meta_df, blackout_set, spy_df,
         if r:
             results.append(r)
 
-    # Jaccard anti-clone
     clone_penalized = 0
     for i, r in enumerate(results):
         if not r.top_edges:
@@ -595,12 +626,12 @@ def run_screen_from_data(prices_df, meta_df, blackout_set, spy_df,
     qualified = [r for r in results
                  if r.score >= min_qualified_score and r.regime_fit == "aligned"]
 
-    print(f"Universe: {len(results)} | Qualified: {len(qualified)}")
+    print(f"\nUniverse: {len(results)} | Qualified: {len(qualified)}")
     return qualified[:top_n], regime, notes
 
 
 # ============================================================
-# Google Sheets — الاتصال والقراءة/الكتابة
+# Google Sheets
 # ============================================================
 def get_gspread_client():
     scope = [
@@ -619,7 +650,6 @@ def get_or_create_ws(sh, title, rows=2000, cols=20):
 
 
 def load_picks_from_sheets(client):
-    """يقرأ picks_history من ورقة 'Picks History' — إن لم توجد يُرجع DataFrame فارغ."""
     try:
         sh = client.open_by_key(SHEET_ID)
         ws = sh.worksheet("Picks History")
@@ -637,7 +667,6 @@ def load_picks_from_sheets(client):
 
 
 def save_picks_to_sheets(client, picks_df):
-    """يحفظ picks_history كاملة في ورقة 'Picks History'."""
     sh = client.open_by_key(SHEET_ID)
     ws = get_or_create_ws(sh, "Picks History")
     ws.clear()
@@ -654,7 +683,6 @@ def save_picks_to_sheets(client, picks_df):
 # تتبع الإشارات
 # ============================================================
 def save_new_picks(results_list, regime, picks_history):
-    """يضيف إشارات اليوم إلى picks_history."""
     today = pd.Timestamp.now().normalize()
     new_rows = []
     for r in results_list:
@@ -684,7 +712,6 @@ def save_new_picks(results_list, regime, picks_history):
         return picks_history
     new_df = pd.DataFrame(new_rows)
     if len(picks_history) > 0:
-        # تجنب التكرار لنفس اليوم
         mask = ~((picks_history["pick_date"].astype(str) == str(today.date())) &
                  (picks_history["ticker"].isin(new_df["ticker"])))
         combined = pd.concat([picks_history[mask], new_df], ignore_index=True)
@@ -694,10 +721,8 @@ def save_new_picks(results_list, regime, picks_history):
 
 
 def evaluate_open_picks(picks_history, prices_df, max_hold_days=HOLD_DAYS):
-    """يقيّم الإشارات المفتوحة إذا مرّت max_hold_days."""
     if len(picks_history) == 0:
         return picks_history
-
     prices_df = prices_df.copy()
     prices_df["date"] = pd.to_datetime(prices_df["date"])
 
@@ -769,13 +794,12 @@ def compute_stats(picks_history):
 
 
 # ============================================================
-# التصدير إلى Sheets
+# التصدير
 # ============================================================
 def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
     sh = client.open_by_key(SHEET_ID)
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # --- Daily Screen ---
     ws = get_or_create_ws(sh, "Daily Screen")
     ws.clear()
     header = [
@@ -807,7 +831,6 @@ def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
         df = pd.DataFrame(rows)
         ws.update("A5", [df.columns.tolist()] + df.values.tolist())
 
-    # --- Performance ---
     if stats:
         ws_p = get_or_create_ws(sh, "Performance")
         ws_p.clear()
@@ -825,7 +848,6 @@ def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
         ]
         ws_p.update("A1", perf)
 
-    # --- Open Positions ---
     if len(picks_history) > 0:
         open_picks = picks_history[picks_history["status"] == "open"]
         if len(open_picks) > 0:
@@ -857,11 +879,9 @@ def main():
         print(f"❌ ملف Service Account غير موجود: {SA_FILE}")
         sys.exit(1)
 
-    # 1) الاتصال بـ Google Sheets
     client = get_gspread_client()
     print("✅ تم الاتصال بـ Google Sheets")
 
-    # 2) جلب البيانات
     tickers = get_sp500_tickers()
     if not tickers:
         print("❌ لا توجد قائمة أسهم")
@@ -872,12 +892,12 @@ def main():
         print("❌ فشل تحميل الأسعار")
         sys.exit(1)
 
-    long_df = prices_to_long(prices_wide)
+    long_df = prices_to_long(prices_wide)         # ✅ محدّث
+    validate_latest_date(long_df)                  # ✅ جديد
     spy_df = download_spy(period=PERIOD)
     meta_df = fetch_metadata(tickers, max_tickers=MAX_META)
     blackout_set = build_earnings_blackout(meta_df, window_days=3)
 
-    # 3) تشغيل المسح
     results_list, regime, notes = run_screen_from_data(
         prices_df=long_df,
         meta_df=meta_df,
@@ -897,28 +917,34 @@ def main():
               f"Style: {style:<15} Conf: {r.confidence:<7} "
               f"Edges: {len(r.top_edges)}")
 
-    # 4) تحميل picks_history من Sheets
+    # ===== تشخيص إضافي =====
+    print("\n" + "=" * 70)
+    print("🔍 DIAGNOSTIC — VLO status")
+    print("=" * 70)
+    vlo_data = long_df[long_df["ticker"] == "VLO"]
+    if len(vlo_data) == 0:
+        print("❌ VLO غير موجود في long_df!")
+    else:
+        last_vlo = vlo_data.sort_values("date").iloc[-1]
+        print(f"VLO صفوف: {len(vlo_data)}")
+        print(f"VLO آخر تاريخ: {last_vlo['date'].date()}")
+        print(f"VLO آخر close: {last_vlo['close']}")
+        print(f"VLO آخر volume: {last_vlo['volume']:,}")
+
     picks_history = load_picks_from_sheets(client)
     print(f"\n📥 picks_history: {len(picks_history)} صف")
 
-    # 5) تقييم الإشارات القديمة
     if len(picks_history) > 0:
         picks_history = evaluate_open_picks(picks_history, long_df)
         newly_closed = picks_history[picks_history["status"].isin(
             ["win", "loss", "timeout"])]
         print(f"✅ إشارات مغلقة إجمالًا: {len(newly_closed)}")
 
-    # 6) إضافة إشارات اليوم
     picks_history = save_new_picks(results_list, regime, picks_history)
-
-    # 7) حفظ picks_history في Sheets
     save_picks_to_sheets(client, picks_history)
     print(f"💾 تم حفظ picks_history ({len(picks_history)} صف)")
 
-    # 8) حساب الإحصاءات
     stats = compute_stats(picks_history)
-
-    # 9) التصدير
     export_to_sheets(client, results_list, picks_history, stats, regime, notes)
 
     print("\n✅ اكتمل التشغيل بنجاح")
