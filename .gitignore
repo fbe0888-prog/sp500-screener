@@ -1,0 +1,9 @@
+sa.json
+*.json
+!package.json
+!requirements.txt
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+screen_results*.csv
+backtest_results.csv
