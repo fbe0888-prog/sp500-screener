@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-S&P 500 Multi-Edge Screener — Cloud Version v4
+S&P 500 Multi-Edge Screener — Cloud Version v5
 ================================================
 الإصلاحات:
+- _to_str / _df_to_rows: تحويل كل القيم إلى نص قبل إرسالها لـSheets
+- save_picks_to_sheets / export_to_sheets: تستخدمان التحويل الآمن
 - load_picks_from_sheets: تحويل الأعمدة الرقمية إلى float
-- evaluate_open_picks: حماية try/except لكل صف + logging
+- evaluate_open_picks: try/except لكل صف + logging
 - prices_to_long: التحقق من NaN في آخر صف
 - validate_latest_date: التحقق من حداثة البيانات
-- تشخيص مفصل في الـlogs
 """
 
 import os
@@ -382,7 +383,6 @@ def download_prices(tickers, period="1y"):
 
 
 def prices_to_long(prices_wide):
-    """يتحقق من NaN في آخر صف لكل سهم."""
     records = []
     for ticker in prices_wide.columns.levels[0]:
         try:
@@ -647,8 +647,31 @@ def get_or_create_ws(sh, title, rows=2000, cols=20):
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
+def _to_str(x):
+    """✅ تحويل أي قيمة إلى نص آمن لـ Google Sheets."""
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(x, pd.Timestamp):
+        return x.strftime("%Y-%m-%d")
+    if isinstance(x, timedelta):
+        return str(x)
+    return str(x)
+
+
+def _df_to_rows(df):
+    """✅ تحويل DataFrame إلى list of lists (كل القيم نصية)."""
+    df = df.copy()
+    for col in df.columns:
+        df[col] = df[col].apply(_to_str)
+    return [df.columns.tolist()] + df.values.tolist()
+
+
 def load_picks_from_sheets(client):
-    """تحويل الأعمدة الرقمية من Sheets إلى float."""
     try:
         sh = client.open_by_key(SHEET_ID)
         ws = sh.worksheet("Picks History")
@@ -674,16 +697,14 @@ def load_picks_from_sheets(client):
 
 
 def save_picks_to_sheets(client, picks_df):
+    """✅ يستخدم _df_to_rows لتحويل كل القيم إلى نص."""
     sh = client.open_by_key(SHEET_ID)
     ws = get_or_create_ws(sh, "Picks History")
     ws.clear()
     if len(picks_df) == 0:
         return
-    df = picks_df.copy()
-    for col in ["pick_date", "exit_date"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).replace("NaT", "")
-    ws.update("A1", [df.columns.tolist()] + df.fillna("").values.tolist())
+    rows = _df_to_rows(picks_df)
+    ws.update("A1", rows)
 
 
 # ============================================================
@@ -844,9 +865,11 @@ def compute_stats(picks_history):
 # التصدير
 # ============================================================
 def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
+    """✅ يستخدم _df_to_rows لتحويل كل القيم إلى نص."""
     sh = client.open_by_key(SHEET_ID)
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    # --- Daily Screen ---
     ws = get_or_create_ws(sh, "Daily Screen")
     ws.clear()
     header = [
@@ -876,8 +899,9 @@ def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
                 "reason": r.reason,
             })
         df = pd.DataFrame(rows)
-        ws.update("A5", [df.columns.tolist()] + df.values.tolist())
+        ws.update("A5", _df_to_rows(df))
 
+    # --- Performance ---
     if stats:
         ws_p = get_or_create_ws(sh, "Performance")
         ws_p.clear()
@@ -895,6 +919,7 @@ def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
         ]
         ws_p.update("A1", perf)
 
+    # --- Open Positions ---
     if len(picks_history) > 0:
         open_picks = picks_history[picks_history["status"] == "open"]
         if len(open_picks) > 0:
@@ -904,8 +929,8 @@ def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
                     "confidence", "style", "regime"]
             cols = [c for c in cols if c in open_picks.columns]
             ws_o.update("A1", [[f"Open Positions — {today_str}"]])
-            sub = open_picks[cols].fillna("")
-            ws_o.update("A3", [sub.columns.tolist()] + sub.values.tolist())
+            sub = open_picks[cols].copy()
+            ws_o.update("A3", _df_to_rows(sub))
 
     print(f"🔗 https://docs.google.com/spreadsheets/d/{SHEET_ID}")
 
@@ -964,7 +989,7 @@ def main():
               f"Style: {style:<15} Conf: {r.confidence:<7} "
               f"Edges: {len(r.top_edges)}")
 
-    # ===== تشخيص إضافي =====
+    # ===== تشخيص VLO =====
     print("\n" + "=" * 70)
     print("🔍 DIAGNOSTIC — VLO status")
     print("=" * 70)
