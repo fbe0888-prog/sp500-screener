@@ -1,0 +1,50 @@
+name: Daily S&P 500 Screen
+
+on:
+  schedule:
+    - cron: '30 20 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Service Account JSON
+        run: |
+          echo '${{ secrets.GCP_SERVICE_ACCOUNT }}' > sa.json
+
+      - name: Run Screener
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: sa.json
+        run: python sp500_screener.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screen-results
+          path: |
+            screen_results.csv
+            picks_history.csv
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: rm -f sa.json
