@@ -2,7 +2,10 @@ name: Daily S&P 500 Screen
 
 on:
   schedule:
-    - cron: '30 20 * * 1-5'
+    # 12:00 UTC = 8:00 AM NY (صيف) / 7:00 AM NY (شتاء)
+    # الثلاثاء-السبت UTC = الاثنين-الجمعة NY
+    # يضمن أن بيانات اليوم السابق مكتملة 100%
+    - cron: '0 12 * * 2-6'
   workflow_dispatch:
 
 jobs:
