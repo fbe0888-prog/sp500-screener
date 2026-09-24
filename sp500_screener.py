@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-S&P 500 Multi-Edge Screener — Cloud Version v5
+S&P 500 Multi-Edge Screener — Cloud Version v6
 ================================================
-الإصلاحات:
-- _to_str / _df_to_rows: تحويل كل القيم إلى نص قبل إرسالها لـSheets
-- save_picks_to_sheets / export_to_sheets: تستخدمان التحويل الآمن
-- load_picks_from_sheets: تحويل الأعمدة الرقمية إلى float
-- evaluate_open_picks: try/except لكل صف + logging
-- prices_to_long: التحقق من NaN في آخر صف
-- validate_latest_date: التحقق من حداثة البيانات
+الإصلاحات والإضافات:
+- A: تنظيف تلقائي للصفوف التالفة في picks_history
+- B: إرسال إيميل HTML بأفضل 3 أسهم + إحصاءات
+- C: رسم بياني لـHit Rate داخل Google Sheets
+- إصلاحات سابقة: NaN handling, Timestamp serialization, دفاعية كاملة
 """
 
 import os
 import sys
 import time
 import warnings
+import smtplib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import numpy as np
 import pandas as pd
@@ -648,7 +649,7 @@ def get_or_create_ws(sh, title, rows=2000, cols=20):
 
 
 def _to_str(x):
-    """✅ تحويل أي قيمة إلى نص آمن لـ Google Sheets."""
+    """تحويل أي قيمة إلى نص آمن لـ Google Sheets."""
     if x is None:
         return ""
     try:
@@ -664,7 +665,7 @@ def _to_str(x):
 
 
 def _df_to_rows(df):
-    """✅ تحويل DataFrame إلى list of lists (كل القيم نصية)."""
+    """تحويل DataFrame إلى list of lists (كل القيم نصية)."""
     df = df.copy()
     for col in df.columns:
         df[col] = df[col].apply(_to_str)
@@ -672,6 +673,7 @@ def _df_to_rows(df):
 
 
 def load_picks_from_sheets(client):
+    """✅ A: تنظيف تلقائي للصفوف التالفة."""
     try:
         sh = client.open_by_key(SHEET_ID)
         ws = sh.worksheet("Picks History")
@@ -679,6 +681,13 @@ def load_picks_from_sheets(client):
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
+
+        # ✅ A: إزالة الصفوف التالفة
+        if "pick_date" in df.columns:
+            s = df["pick_date"].astype(str).str.strip()
+            df = df[(s != "") & (s != "NaT") & (s != "nan") & (s != "None")]
+        if "ticker" in df.columns:
+            df = df[df["ticker"].astype(str).str.strip() != ""]
 
         numeric_cols = ["score", "entry", "stop", "target",
                         "edge_count", "exit_price", "pnl_pct", "days_held"]
@@ -690,14 +699,13 @@ def load_picks_from_sheets(client):
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        return df
+        return df.reset_index(drop=True)
     except Exception as e:
         print(f"ℹ️ لا يوجد picks history بعد: {e}")
         return pd.DataFrame()
 
 
 def save_picks_to_sheets(client, picks_df):
-    """✅ يستخدم _df_to_rows لتحويل كل القيم إلى نص."""
     sh = client.open_by_key(SHEET_ID)
     ws = get_or_create_ws(sh, "Picks History")
     ws.clear()
@@ -862,10 +870,189 @@ def compute_stats(picks_history):
 
 
 # ============================================================
+# ✅ B: الإيميل
+# ============================================================
+def send_email_report(results_list, stats, regime):
+    """إرسال تقرير HTML بأفضل 3 أسهم + إحصاءات."""
+    email_user = os.environ.get("EMAIL_USER")
+    email_pass = os.environ.get("EMAIL_APP_PASSWORD")
+    email_to = os.environ.get("EMAIL_TO")
+
+    if not all([email_user, email_pass, email_to]):
+        print("ℹ️ إعدادات الإيميل غير مكتملة — تم التخطي")
+        return
+
+    today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    rows_html = ""
+    for i, r in enumerate(results_list[:3], 1):
+        style = ("Trend" if r.style_votes["trend"] > r.style_votes["mean_reversion"]
+                 else "Mean-Reversion")
+        edges = ", ".join(str(e) for e in r.top_edges)
+        rows_html += f"""
+        <tr>
+          <td style="padding:8px;font-weight:bold">{i}. {r.ticker}</td>
+          <td style="padding:8px">{r.score}</td>
+          <td style="padding:8px">{style}</td>
+          <td style="padding:8px">{r.confidence}</td>
+          <td style="padding:8px;font-family:monospace">{r.entry} / {r.stop} / {r.target}</td>
+          <td style="padding:8px;font-size:12px;color:#555">{edges}</td>
+        </tr>"""
+
+    if stats:
+        stats_html = f"""
+        <h3 style="margin-top:24px">📈 الأداء التراكمي</h3>
+        <ul>
+          <li>إجمالي الإشارات المغلقة: <b>{stats['total']}</b></li>
+          <li>Wins: <b>{stats['wins']}</b> | Losses: <b>{stats['losses']}</b> | Timeouts: <b>{stats['timeouts']}</b></li>
+          <li>Hit Rate: <b>{stats['hit_rate']:.1f}%</b></li>
+          <li>Expectancy: <b>{stats['expectancy']:+.2f}%</b> لكل صفقة</li>
+        </ul>"""
+    else:
+        stats_html = "<p style='color:#888'>لا توجد إشارات مغلقة بعد — التقييم يبدأ بعد 5 أيام تداول.</p>"
+
+    body = f"""
+    <html><body style="font-family:Arial,sans-serif;color:#222">
+      <h2>📊 S&P 500 Multi-Edge Screen</h2>
+      <p><b>التاريخ:</b> {today_str}<br>
+         <b>النظام:</b> {regime}<br>
+         <b>الإعدادات الصالحة:</b> {len(results_list)}</p>
+
+      <h3>🏆 أفضل 3 أسهم</h3>
+      <table style="border-collapse:collapse;border:1px solid #ddd;width:100%">
+        <thead>
+          <tr style="background:#f0f0f0">
+            <th style="padding:8px">Ticker</th>
+            <th style="padding:8px">Score</th>
+            <th style="padding:8px">Style</th>
+            <th style="padding:8px">Confidence</th>
+            <th style="padding:8px">Entry/Stop/Target</th>
+            <th style="padding:8px">Edges</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+
+      {stats_html}
+
+      <p style="margin-top:24px;font-size:12px;color:#888">
+        🔗 الجدول الكامل:
+        <a href="https://docs.google.com/spreadsheets/d/{SHEET_ID}">Google Sheets</a>
+      </p>
+    </body></html>
+    """
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"📊 S&P Screen — {today_str[:10]}"
+        msg["From"] = email_user
+        msg["To"] = email_to
+        msg.attach(MIMEText(body, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(email_user, email_pass)
+            server.send_message(msg)
+
+        print(f"✅ تم إرسال الإيميل إلى {email_to}")
+    except Exception as e:
+        print(f"⚠️ فشل إرسال الإيميل: {e}")
+
+
+# ============================================================
+# ✅ C: الرسوم البيانية
+# ============================================================
+def create_performance_charts(client):
+    """إنشاء رسم بياني في ورقة Performance."""
+    try:
+        sh = client.open_by_key(SHEET_ID)
+        ws = sh.worksheet("Performance")
+        sheet_id = ws._properties["sheetId"]
+
+        all_values = ws.get_all_values()
+        if len(all_values) < 6:
+            print("ℹ️ بيانات غير كافية للرسم البياني")
+            return
+
+        # اقرأ الإحصاءات من الورقة
+        stats_dict = {}
+        for row in all_values:
+            if len(row) >= 2:
+                stats_dict[row[0]] = row[1]
+
+        try:
+            wins_val = int(float(stats_dict.get("Wins", 0) or 0))
+            losses_val = int(float(stats_dict.get("Losses", 0) or 0))
+            timeouts_val = int(float(stats_dict.get("Timeouts", 0) or 0))
+        except Exception:
+            wins_val = losses_val = timeouts_val = 0
+
+        # اكتب البيانات المساعدة في D1:E4
+        helper_data = [
+            ["Status", "Count"],
+            ["Wins", wins_val],
+            ["Losses", losses_val],
+            ["Timeouts", timeouts_val],
+        ]
+        ws.update("D1", helper_data)
+
+        # احذف أي رسوم قديمة
+        try:
+            meta = sh.fetch_sheet_metadata()
+            charts_to_delete = []
+            for sheet in meta.get("sheets", []):
+                if sheet["properties"]["sheetId"] == sheet_id:
+                    for chart in sheet.get("charts", []):
+                        charts_to_delete.append(
+                            {"deleteEmbeddedObject": {"objectId": chart["chartId"]}}
+                        )
+            if charts_to_delete:
+                sh.batch_update({"requests": charts_to_delete})
+        except Exception:
+            pass
+
+        # أضف رسم دائري
+        requests = [{
+            "addChart": {
+                "chart": {
+                    "spec": {
+                        "title": "توزيع نتائج الإشارات",
+                        "pieChart": {
+                            "legendPosition": "RIGHT_LEGEND",
+                            "domain": {"sourceRange": {"sources": [{
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1, "endRowIndex": 4,
+                                "startColumnIndex": 3, "endColumnIndex": 4,
+                            }]}},
+                            "series": {"sourceRange": {"sources": [{
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1, "endRowIndex": 4,
+                                "startColumnIndex": 4, "endColumnIndex": 5,
+                            }]}},
+                        },
+                    },
+                    "position": {
+                        "overlayPosition": {
+                            "anchorCell": {
+                                "sheetId": sheet_id,
+                                "rowIndex": 12, "columnIndex": 3,
+                            },
+                            "widthPixels": 420, "heightPixels": 280,
+                        }
+                    },
+                }
+            }
+        }]
+
+        sh.batch_update({"requests": requests})
+        print("✅ تم إنشاء الرسم البياني في Performance")
+    except Exception as e:
+        print(f"⚠️ فشل إنشاء الرسم: {e}")
+
+
+# ============================================================
 # التصدير
 # ============================================================
 def export_to_sheets(client, results_list, picks_history, stats, regime, notes):
-    """✅ يستخدم _df_to_rows لتحويل كل القيم إلى نص."""
     sh = client.open_by_key(SHEET_ID)
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -989,7 +1176,7 @@ def main():
               f"Style: {style:<15} Conf: {r.confidence:<7} "
               f"Edges: {len(r.top_edges)}")
 
-    # ===== تشخيص VLO =====
+    # ===== DIAGNOSTIC =====
     print("\n" + "=" * 70)
     print("🔍 DIAGNOSTIC — VLO status")
     print("=" * 70)
@@ -1003,6 +1190,7 @@ def main():
         print(f"VLO آخر close: {last_vlo['close']}")
         print(f"VLO آخر volume: {last_vlo['volume']:,}")
 
+    # ===== picks_history =====
     picks_history = load_picks_from_sheets(client)
     print(f"\n📥 picks_history: {len(picks_history)} صف")
 
@@ -1016,8 +1204,15 @@ def main():
     save_picks_to_sheets(client, picks_history)
     print(f"💾 تم حفظ picks_history ({len(picks_history)} صف)")
 
+    # ===== الإحصاءات والتصدير =====
     stats = compute_stats(picks_history)
     export_to_sheets(client, results_list, picks_history, stats, regime, notes)
+
+    # ✅ C: إنشاء الرسوم
+    create_performance_charts(client)
+
+    # ✅ B: إرسال الإيميل
+    send_email_report(results_list, stats, regime)
 
     print("\n✅ اكتمل التشغيل بنجاح")
 
