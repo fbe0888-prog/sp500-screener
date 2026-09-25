@@ -2,10 +2,9 @@ name: Daily S&P 500 Screen
 
 on:
   schedule:
-    # 12:00 UTC = 8:00 AM NY (صيف) / 7:00 AM NY (شتاء)
-    # الثلاثاء-السبت UTC = الاثنين-الجمعة NY
-    # يضمن أن بيانات اليوم السابق مكتملة 100%
-    - cron: '0 12 * * 2-6'
+    # 12:00 UTC = 15:00 السعودية
+    # الاثنين-الجمعة بتوقيت السعودية
+    - cron: '0 12 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -36,6 +35,9 @@ jobs:
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: sa.json
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python sp500_screener.py
 
       - name: Upload artifacts
